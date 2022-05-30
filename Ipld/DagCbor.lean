@@ -1,6 +1,8 @@
 import Ipld.Ipld
 import Ipld.Multihash
 import Std.Data.RBTree
+import LSpec.Meta
+import Ipld.Util.ForLSpec
 
 namespace DagCbor
 
@@ -278,3 +280,96 @@ partial def deserialize (x: ByteArray) : Except DeserializeError Ipld :=
   | EStateM.Result.error e _ => Except.error e
 
 end DagCbor
+
+section DagCborTests
+
+open DagCbor 
+
+instance : BEq (Except DeserializeError Ipld) where
+  beq
+  | Except.ok x, Except.ok y => x == y
+  | Except.error x, Except.error y => x == y
+  | _, _ => false
+
+def case := (Ipld.null, ByteArray.mk #[246])
+  -- ,  (Ipld.bool true) (ByteArray.mk #[245])
+  -- ,  (Ipld.bool false) (ByteArray.mk #[244])
+  -- ,  (Ipld.number 0) (ByteArray.mk #[0])
+  -- ,  (Ipld.number 0x17) (ByteArray.mk #[23])
+  -- ,  (Ipld.number 0x18) (ByteArray.mk #[24,24])
+  -- ,  (Ipld.number 0xff) (ByteArray.mk #[24,255])
+  -- ,  (Ipld.number 0x100) (ByteArray.mk #[25,1,0])
+  -- ,  (Ipld.number 0xffff) (ByteArray.mk #[25,255,255])
+  -- ,  (Ipld.number 0x10000) (ByteArray.mk #[26,0,1,0,0])
+  -- ,  (Ipld.number 0xffffffff) (ByteArray.mk #[26,255,255,255,255])
+  -- ,  (Ipld.number 0x100000000) (ByteArray.mk #[27, 0,0,0,1,0,0,0,0])
+  -- ,  (Ipld.string "Hello") (ByteArray.mk #[0x65, 0x48, 0x65, 0x6c, 0x6c, 0x6f])
+  -- ,  (Ipld.bytes "Hello".toUTF8) (ByteArray.mk #[0x45, 0x48, 0x65, 0x6c, 0x6c, 0x6f])
+  -- ,  (Ipld.array #[Ipld.string "Hello"]) (ByteArray.mk #[0x81, 0x65, 0x48, 0x65, 0x6c, 0x6c, 0x6f])
+  -- ,  (Ipld.object (Std.RBNode.singleton "Hello" (Ipld.string "World")))
+  --   (ByteArray.mk #[0xa1, 0x65, 0x48, 0x65, 0x6c, 0x6c, 0x6f, 0x65, 0x57, 0x6f, 0x72, 0x6c, 0x64])
+
+open Lean
+
+/-
+copied these for debugging
+-/
+private def getBool! : Expr → Bool
+  | .const ``Bool.true  .. => true
+  | .const ``Bool.false .. => false
+  | _                      => unreachable!
+
+private def getStr! : Expr → String
+  | .lit (.strVal s) _ => s
+  | _                  => unreachable!
+
+private def getOptionStr! (e : Expr) : Option String :=
+  if e.isAppOf ``Option.some then some (getStr! $ e.getArg! 2)
+  else
+    if e.isAppOf ``Option.none then none
+    else unreachable!
+
+private def recoverTestResult! (res : Expr) : Bool × String :=
+  (getBool! $ res.getArg! 2, getStr! $ res.getArg! 3)
+
+open Meta Elab Command Term in
+elab "#spec2 " term:term : command =>
+  liftTermElabM `assert do
+    let term ← elabTerm term none
+    synthesizeSyntheticMVarsNoPostponing
+    let type ← inferType term
+    if type.isAppOf ``ExampleOf then
+      -- `Option String × Bool × String`
+      let res ← reduce (← mkAppM ``ExampleOf.run #[term])
+      let descr := getOptionStr! (res.getArg! 2)
+      match recoverTestResult! (res.getArg! 3) with
+      | (true,  msg) => logInfo $
+        if descr.isSome then s!"{descr.get!}:\n{msg}" else msg
+      | (false, msg) => throwError
+        if descr.isSome then s!"{descr.get!}:\n{msg}" else msg -- `#spec2` gets to this logic branch for some reason
+    else if type.isAppOf ``ExamplesOf then
+       -- `Option String × List (Bool × String)`
+      let res ← reduce (← mkAppM ``ExamplesOf.run #[term])
+      let descr := getOptionStr! (res.getArg! 2)
+      match (res.getArg! 3).listLit? with
+      | none => unreachable!
+      | some (_, res) =>
+        let res := res.map recoverTestResult!
+        let success? := res.foldl (init := true) fun acc (b, _) => acc && b
+        let msg' : String := match descr with
+          | none => "\n".intercalate $ res.map fun (_, msg) => msg
+          | some d =>
+            s!"{d}\n" ++ ("\n".intercalate $ res.map fun (_, msg) => msg)
+        if success? then logInfo msg' else throwError msg'
+    else throwError "Invalid term to run '#spec' with"
+
+mkspec deserializeSpec : deserialize ∘ serialize := exceptDepEquals (deserialize ∘ serialize)
+
+#reduce deserializeSpec.testParam
+#check ((Ipld.null,Ipld.null) : deserializeSpec.testParam) 
+
+def nullExample : ExampleOf deserializeSpec := .fromDescrParam "asdfasdf" (Ipld.null, Ipld.null)
+#spec2 nullExample
+#eval ExampleOf.run nullExample
+
+end DagCborTests
